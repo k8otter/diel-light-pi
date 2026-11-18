@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Timed CSI-camera recording for Raspberry Pi 5. Run on the Pi desktop."""
+"""Timed CSI and USB camera recording for Raspberry Pi 5. Run on the Pi desktop."""
 import json
 import math
 import re
@@ -33,10 +33,14 @@ class Settings:
     location: str = ""
     organism: str = ""
     notes: str = ""
+    usb_device: str = ""
+    usb_format: str = "auto"
 
     def validate(self):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", self.initials):
             raise ValueError("Initials must contain only letters, numbers, underscores or hyphens.")
+        if not re.fullmatch(r"[A-Za-z0-9_ -]*", self.project):
+            raise ValueError("Project ID may contain letters (A–Z), numbers, spaces, underscores, and hyphens.")
         if self.date:
             if not re.fullmatch(r"\d{8}", self.date):
                 raise ValueError("Date must be YYYYMMDD, or blank for today's date.")
@@ -51,18 +55,40 @@ class Settings:
                 raise ValueError(f"{name} must be between {low} and {high}.")
         if self.resolution not in ("1920x1080", "1280x720"):
             raise ValueError("Choose 1920x1080 or 1280x720.")
+        if self.usb_device and not self.usb_device.startswith("/dev/"):
+            raise ValueError("Enter a USB device path such as /dev/video0.")
+        if self.usb_format not in ("auto", "mjpeg", "yuyv422"):
+            raise ValueError("Choose auto, mjpeg, or yuyv422 for USB input format.")
         if not self.output.strip():
             raise ValueError("Choose an output folder.")
 
     def prefix(self):
         date = self.date or datetime.now().strftime("%Y%m%d")
-        return f"{self.initials}_{date}_trial{self.trial}"
+        project = "_".join(self.project.split())
+        parts = [self.initials, date]
+        if project:
+            parts.append(project)
+        parts.append(f"trial{self.trial}")
+        return "_".join(parts)
 
     def estimated_bytes(self):
         return int(self.bitrate_mbps * 1_000_000 / 8 * self.duration_minutes * 60)
 
 
+def usb_input(s):
+    args = ["-f", "v4l2", "-video_size", s.resolution, "-framerate", str(s.fps)]
+    if s.usb_format != "auto":
+        args += ["-input_format", s.usb_format]
+    return args + ["-i", s.usb_device]
+
+
 def camera_command(s):
+    if s.usb_device:
+        bitrate = str(round(s.bitrate_mbps * 1_000_000))
+        return ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+                *usb_input(s), "-t", str(s.duration_minutes * 60), "-an",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-b:v", bitrate, "-g", str(s.fps), "-f", "mpegts", "pipe:1"]
     width, height = s.resolution.split("x")
     cmd = ["rpicam-vid", "--camera", str(s.camera), "--timeout", str(round(s.duration_minutes * 60000)),
            "--width", width, "--height", height, "--framerate", str(s.fps),
@@ -101,7 +127,9 @@ def finish_process(proc, timeout=15):
 def record(s, stop, report):
     """One camera process feeds one segmenter. No restarts between MP4 files."""
     s.validate()
-    for executable in ("rpicam-vid", "ffmpeg"):
+    if s.usb_device and s.preview:
+        raise ValueError("For USB cameras, use the 10-second preview before recording.")
+    for executable in (("ffmpeg",) if s.usb_device else ("rpicam-vid", "ffmpeg")):
         if not shutil.which(executable):
             raise RuntimeError(f"Missing {executable}. Follow the installation steps in README.md.")
     base = Path(s.output).expanduser().resolve()
@@ -228,11 +256,12 @@ class App:
         canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
         defaults = asdict(Settings())
         groups = (("Trial details", (("initials", "Initials *"), ("date", "Date YYYYMMDD (blank = today)"),
-                  ("trial", "Trial number *"), ("experimenter", "Experimenter"), ("project", "Project"),
+                  ("trial", "Trial number *"), ("experimenter", "Experimenter"), ("project", "Project ID / name"),
                   ("location", "Location"), ("organism", "Organism"), ("notes", "Notes"), ("output", "Output folder *"))),
                   ("Recording settings", (("duration_minutes", "Duration (minutes)"), ("segment_minutes", "File length (minutes)"),
                   ("fps", "Frames per second"), ("resolution", "Resolution"), ("bitrate_mbps", "Target bitrate (Mbps)"),
-                  ("camera", "Camera index"))))
+                  ("camera", "CSI camera index"), ("usb_device", "USB device path (blank for CSI)"),
+                  ("usb_format", "USB input format"))))
         for title, fields in groups:
             group = ttk.LabelFrame(form, text=title, style="Section.TLabelframe", padding=14)
             group.pack(fill="x", pady=(0, 10))
@@ -241,7 +270,9 @@ class App:
                 ttk.Label(group, text=label, style="Body.TLabel").grid(row=row, column=0, sticky="w", pady=4, padx=(0, 15))
                 var = tk.StringVar(value=str(defaults[key]))
                 self.vars[key] = var
-                if key in ("fps", "resolution"):
+                if key == "usb_format":
+                    control = ttk.Combobox(group, textvariable=var, state="readonly", values=("auto", "mjpeg", "yuyv422"))
+                elif key in ("fps", "resolution"):
                     control = ttk.Combobox(group, textvariable=var, state="readonly", values=(20, 25, 30) if key == "fps" else ("1920x1080", "1280x720"))
                 else:
                     control = ttk.Entry(group, textvariable=var)
@@ -253,7 +284,7 @@ class App:
                     self.controls.append(browse)
                 var.trace_add("write", lambda *args: self.update_estimate())
         self.preview_var = tk.BooleanVar(value=False)
-        check = ttk.Checkbutton(form, text="Show camera preview during recording (separate window)", variable=self.preview_var)
+        check = ttk.Checkbutton(form, text="Show CSI camera preview during recording", variable=self.preview_var)
         check.pack(anchor="w", pady=5)
         self.controls.append(check)
         self.estimate = tk.StringVar()
@@ -322,11 +353,15 @@ class App:
     def preview(self):
         try:
             s = self.settings()
-            if not shutil.which("rpicam-hello"):
-                raise RuntimeError("Missing rpicam-hello. Install rpicam-apps first.")
+            if s.usb_device:
+                cmd = ["ffplay", "-hide_banner", "-autoexit", "-t", "10", *usb_input(s)]
+            else:
+                cmd = ["rpicam-hello", "--camera", str(s.camera), "--timeout", "10000"]
+            if not shutil.which(cmd[0]):
+                raise RuntimeError(f"Missing {cmd[0]}. Follow the installation steps in README.md.")
             if self.preview_process and self.preview_process.poll() is None:
                 return
-            self.preview_process = subprocess.Popen(["rpicam-hello", "--camera", str(s.camera), "--timeout", "10000"])
+            self.preview_process = subprocess.Popen(cmd)
             self.pending_status = "Camera preview open for 10 seconds. Errors appear in the launching terminal."
         except (ValueError, RuntimeError, OSError) as exc:
             messagebox.showerror("Camera preview", str(exc))
